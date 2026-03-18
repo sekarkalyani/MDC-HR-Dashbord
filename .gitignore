@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*.DS_Store
+
+# Virtual environment
+myenv/
+env/
+.venv/
+
+# Logs and database
+*.log
+*.sqlite3
+db.sqlite3
+
+# Environment variables
+.env
+!.env.example  # Keep an example for reference
+
+# Python dependencies
+pip-log.txt
+pip-delete-this-directory.txt
+
+
+# VSCode and JetBrains IDEs
+.vscode/
+.idea/
+
+# Misc
+node_modules/
+npm-debug.log
+yarn-error.log
