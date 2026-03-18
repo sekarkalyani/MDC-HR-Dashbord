@@ -1,6 +1,6 @@
 """
 MDC HR Dashboard — Employee Detail API
-GET /employee/{pernr}  →  employee details, positions, and management chain
+GET /employee/{pernr}  →  selectedEmployee, managerChain, directReports (level 1 only)
 """
 
 from __future__ import annotations
@@ -18,44 +18,57 @@ from pydantic import BaseModel
 # Constants
 # ---------------------------------------------------------------------------
 DATA_DIR = Path(__file__).parent
-PA_FILE = DATA_DIR / "mdc_pa_active_only_ext.json"
-OM_FILE = DATA_DIR / "mdc_om_relationships_fixed.json"
-MAX_MANAGER_LEVELS = 10
+PA_FILE  = DATA_DIR / "mdc_pa_active_only_ext.json"
+OM_FILE  = DATA_DIR / "mdc_om_relationships_fixed.json"
 
-GENDER_MAP = {"1": "Male", "2": "Female", "": "Unknown"}
-MARITAL_MAP = {"0": "Single", "1": "Married", "2": "Separated", "3": "Divorced", "6": "Other", "": "Unknown"}
-STAT2_MAP = {"1": "Withdrawn", "2": "Inactive", "3": "Active", "0": "Not Yet Started"}
-MASSN_MAP = {
-    "01": "Hiring", "02": "Transfer", "04": "Re-hire",
-    "16": "Pay Change", "21": "Org Change",
-}
+MAX_MANAGER_LEVELS = 10   # upward chain depth
+
+GENDER_MAP  = {"1": "Male", "2": "Female", "": "Unknown"}
+MARITAL_MAP = {"0": "Single", "1": "Married", "2": "Separated",
+               "3": "Divorced", "6": "Other", "": "Unknown"}
+STAT2_MAP   = {"1": "Withdrawn", "2": "Inactive", "3": "Active",
+               "0": "Not Yet Started"}
+MASSN_MAP   = {"01": "Hiring", "02": "Transfer", "04": "Re-hire",
+               "16": "Pay Change", "21": "Org Change"}
+
+ADDRESS_SUBTYPE = {"1": "Permanent", "7": "Mailing", "3": "Emergency",
+                   "4": "Other", "R1": "Special"}
+
 
 # ---------------------------------------------------------------------------
-# In-memory indexes (populated at startup)
+# In-memory indexes
 # ---------------------------------------------------------------------------
 class Store:
-    # pernr (int) -> raw employee dict from PA file
-    pa_by_pernr: dict[int, dict] = {}
-    # zero-padded pernr str -> int pernr  (e.g. "00001023" -> 1023)
-    pernr_by_padded: dict[str, int] = {}
-    # SAP user ID (upper) -> int pernr
-    pernr_by_userid: dict[str, int] = {}
+    # PA data
+    pa_by_pernr:     dict[int, dict]    = {}   # pernr (int) → raw employee record
+    pernr_by_padded: dict[str, int]     = {}   # "00001023"  → 1023
+    pernr_by_userid: dict[str, int]     = {}   # "MCURLEY"   → 1023  (from PA0105)
 
-    # OM indexes  (all keyed on str IDs)
-    # position_id -> A002 record (reports-to supervisor position)
-    reports_to: dict[str, str] = {}            # pos_id -> supervisor_pos_id
-    # position_id -> A003 record (org unit)
-    pos_to_org: dict[str, dict] = {}           # pos_id -> {id, name}
-    # position_id -> holder info  (P pernr or US userid)
-    pos_to_holder: dict[str, dict] = {}        # pos_id -> {type, id}
-    # position_id -> position text
-    pos_text: dict[str, str] = {}
+    # OM upward: A002  sub_pos → supervisor_pos
+    reports_to:      dict[str, str]     = {}
+
+    # OM downward: reverse of A002  supervisor_pos → [sub_pos, …]
+    # Built simultaneously with reports_to so it is always consistent.
+    direct_reports:  dict[str, list[str]] = {}
+
+    # OM org-unit assignment: A003  pos_id → {id, name}
+    pos_to_org:      dict[str, dict]    = {}
+
+    # OM position occupancy: A008  pos_id → {type: "P"|"US", id: "…"}
+    pos_to_holder:   dict[str, dict]    = {}
+
+    # Position titles collected from both sides of every OM relationship
+    pos_text:        dict[str, str]     = {}
+
 
 store = Store()
 
 
+# ---------------------------------------------------------------------------
+# Index builder
+# ---------------------------------------------------------------------------
 def _build_indexes(pa_data: dict, om_data: list[dict]) -> None:
-    # --- PA indexes ---
+    # ── PA indexes (active employees only — source file is pre-filtered STAT2=3) ──
     for emp in pa_data["employees"]:
         pernr: int = emp["pernr"]
         store.pa_by_pernr[pernr] = emp
@@ -64,7 +77,7 @@ def _build_indexes(pa_data: dict, om_data: list[dict]) -> None:
             if comm["subty"] == "0001" and comm["usrid"]:
                 store.pernr_by_userid[comm["usrid"].upper()] = pernr
 
-    # --- OM indexes ---
+    # ── OM indexes ──
     for rel in om_data:
         src_type = rel["sourceType"]
         src_id   = rel["sourceId"]
@@ -72,21 +85,24 @@ def _build_indexes(pa_data: dict, om_data: list[dict]) -> None:
         tgt_id   = rel["targetId"]
         relat    = rel["relat"]
 
-        # Collect position text from any side
+        # Collect position titles from both sides of every record
         if src_type == "S" and rel["sourceText"]:
             store.pos_text[src_id] = rel["sourceText"]
         if tgt_type == "S" and rel["targetText"]:
             store.pos_text[tgt_id] = rel["targetText"]
 
-        # A002: position reports-to position (subordinate → supervisor)
+        # A002: subordinate position → supervisor position  (PA0001.plans based)
         if relat == "A002" and src_type == "S" and tgt_type == "S" and tgt_id:
-            store.reports_to[src_id] = tgt_id
+            store.reports_to[src_id] = tgt_id                   # upward
+            store.direct_reports.setdefault(tgt_id, [])
+            if src_id not in store.direct_reports[tgt_id]:      # avoid duplicates
+                store.direct_reports[tgt_id].append(src_id)     # downward
 
         # A003: position belongs to org unit
         if relat == "A003" and src_type == "S" and tgt_type == "O":
             store.pos_to_org[src_id] = {"id": tgt_id, "name": rel["targetText"]}
 
-        # A008: position is held by person (P) or user (US)
+        # A008: position is held by person (P) or SAP user (US)
         if relat == "A008" and src_type == "S" and tgt_id:
             store.pos_to_holder[src_id] = {"type": tgt_type, "id": tgt_id}
 
@@ -96,17 +112,22 @@ async def lifespan(app: FastAPI):
     pa_data = json.loads(PA_FILE.read_text(encoding="utf-8"))
     om_data = json.loads(OM_FILE.read_text(encoding="utf-8"))
     _build_indexes(pa_data, om_data)
-    print(f"[startup] Loaded {len(store.pa_by_pernr)} active employees, {len(store.reports_to)} reporting relationships")
+    total_dr = sum(len(v) for v in store.direct_reports.values())
+    print(
+        f"[startup] {len(store.pa_by_pernr)} active employees · "
+        f"{len(store.reports_to)} upward links · "
+        f"{total_dr} downward links"
+    )
     yield
 
 
 # ---------------------------------------------------------------------------
-# App
+# FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="MDC HR Dashboard API",
-    description="Employee detail, positions, and management chain from SAP HR data.",
-    version="1.0.0",
+    description="Employee detail, managers (upward) and full reporting structure (downward).",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -141,8 +162,9 @@ class PositionModel(BaseModel):
     valid_to: str
 
 
+# ── Upward: manager chain ─────────────────────────────────────────────────────
 class ManagerModel(BaseModel):
-    level: int
+    level: int                    # 1 = direct manager, N = top of chain (CEO)
     pernr: Optional[int]
     first_name: Optional[str]
     last_name: Optional[str]
@@ -155,6 +177,22 @@ class ManagerModel(BaseModel):
     org_unit_name: Optional[str]
 
 
+# ── Downward: directReports — camelCase shape as specified ───────────────────
+# A002 direction used:
+#   OBJID=childPosition, RSIGN="A", RELAT="002", SOBID=selectedEmployeePosition
+#   i.e. JSON: sourceId=childPos  --A002-->  targetId=selectedPos
+#   Direct reports = all sourceIds where targetId == selectedEmployee's position.
+class DirectReportItem(BaseModel):
+    positionId: str
+    positionTitle: Optional[str]
+    pernr: Optional[int]          # None = position vacant or held by inactive person
+    fullName: Optional[str]
+    email: Optional[str]          # PA0105 subtype 0010 only; None if not available
+    orgUnit: Optional[str]        # org unit name from A003
+    level: int = 1                # always 1 — these are immediate direct reports
+
+
+# ── Employee personal data ────────────────────────────────────────────────────
 class EmployeeModel(BaseModel):
     pernr: int
     first_name: str
@@ -188,17 +226,204 @@ class EmployeeModel(BaseModel):
     action_date: Optional[str]
 
 
+# ── Full response ─────────────────────────────────────────────────────────────
 class EmployeeDetailResponse(BaseModel):
-    employee: EmployeeModel
+    selectedEmployee: EmployeeModel
     positions: list[PositionModel]
-    managers: list[ManagerModel]
+    managerChain: list[ManagerModel]       # level 1 = direct manager, level N = CEO
+    directReports: list[DirectReportItem]  # level 1 only — camelCase fields
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
-ADDRESS_SUBTYPE = {"1": "Permanent", "7": "Mailing", "3": "Emergency", "4": "Other", "R1": "Special"}
+def _resolve_holder_pernr(holder: dict) -> Optional[int]:
+    """Resolve A008 holder ({type, id}) → active pernr, or None."""
+    if holder["type"] == "P":
+        return store.pernr_by_padded.get(holder["id"])
+    if holder["type"] == "US":
+        return store.pernr_by_userid.get(holder["id"].upper())
+    return None
 
+
+def _enrich_person(pos_id: str) -> dict:
+    """
+    Return person fields for the active employee currently holding pos_id.
+    All fields are None when the position is vacant or held by an inactive person.
+    Only active employees (STAT2=3) are resolved — inactive holders are excluded
+    because pa_by_pernr is pre-filtered to active-only records.
+    """
+    null = {"pernr": None, "full_name": None, "email": None, "sap_user_id": None}
+    holder = store.pos_to_holder.get(pos_id)
+    if not holder:
+        return null
+    pernr = _resolve_holder_pernr(holder)
+    if not pernr or pernr not in store.pa_by_pernr:
+        return null
+    emp  = store.pa_by_pernr[pernr]
+    p2   = emp["pa0002"][0] if emp.get("pa0002") else {}
+    email = sap_user = None
+    for comm in emp.get("pa0105", []):
+        if comm["subty"] == "0001" and comm["usrid"]:
+            sap_user = comm["usrid"]
+        elif comm["subty"] == "0010" and comm.get("usridLong"):
+            email = comm["usridLong"].strip()
+    return {
+        "pernr":      pernr,
+        "full_name":  f"{p2.get('vorna', '')} {p2.get('nachn', '')}".strip(),
+        "email":      email,
+        "sap_user_id": sap_user,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Builder: upward manager chain  (UNCHANGED from original)
+# ---------------------------------------------------------------------------
+def _build_managers(emp: dict) -> list[ManagerModel]:
+    """
+    Walk A002 upward from the employee's position (PA0001.plans).
+    level 1 = direct manager, level N = CEO / top of chain.
+    """
+    p1 = emp["pa0001"][0] if emp.get("pa0001") else {}
+    current_pos = str(p1.get("plans", "")) if p1.get("plans") else None
+    if not current_pos:
+        return []
+
+    managers: list[ManagerModel] = []
+    visited:  set[str]           = {current_pos}
+
+    for level in range(1, MAX_MANAGER_LEVELS + 1):
+        supervisor_pos = store.reports_to.get(current_pos)
+        if not supervisor_pos or supervisor_pos in visited:
+            break
+        visited.add(supervisor_pos)
+
+        org    = store.pos_to_org.get(supervisor_pos, {})
+        person = _enrich_person(supervisor_pos)
+
+        managers.append(ManagerModel(
+            level=level,
+            pernr=person["pernr"],
+            first_name=None,   # kept for model compat; full_name is sufficient
+            last_name=None,
+            full_name=person["full_name"],
+            email=person["email"],
+            sap_user_id=person["sap_user_id"],
+            position_id=supervisor_pos,
+            position_title=store.pos_text.get(supervisor_pos),
+            org_unit_id=org.get("id"),
+            org_unit_name=org.get("name"),
+        ))
+        current_pos = supervisor_pos
+
+    return managers
+
+
+# ---------------------------------------------------------------------------
+# Builders: downward reporting structure
+# ---------------------------------------------------------------------------
+def _build_direct_reports(root_pos: str) -> list[DirectReportItem]:
+    """
+    Return immediate direct reports of root_pos using A002 as primary source.
+
+    A002 direction (HRP1001 terms):
+        OTYPE=S, OBJID=childPosition, RSIGN="A", RELAT="002",
+        RSOBJT=S, SOBID=selectedEmployeePosition
+
+    In the JSON index this means:
+        relat="A002", sourceId=childPosition, targetId=selectedEmployeePosition
+
+    So direct_reports[root_pos] = all sourceIds where A002.targetId == root_pos.
+
+    Only active employees (STAT2=3) are resolved; vacant/inactive → pernr=None.
+    PA0002 used for name; PA0105 subtype 0010 for email.
+    """
+    result: list[DirectReportItem] = []
+    for pos_id in store.direct_reports.get(root_pos, []):
+        org    = store.pos_to_org.get(pos_id, {})
+        person = _enrich_person(pos_id)
+        result.append(DirectReportItem(
+            positionId=pos_id,
+            positionTitle=store.pos_text.get(pos_id),
+            pernr=person["pernr"],
+            fullName=person["full_name"],
+            email=person["email"],
+            orgUnit=org.get("name"),
+            level=1,
+        ))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.get(
+    "/employee/{pernr}",
+    response_model=EmployeeDetailResponse,
+    summary="Full employee profile with upward manager chain and downward reporting structure",
+    tags=["Employee"],
+)
+def get_employee(pernr: int):
+    """
+    **Upward** (`managers`):
+    - Walks A002 from `PA0001.plans` to the top of the hierarchy.
+    - `level 1` = direct manager … `level N` = CEO / root.
+
+    **Downward** (three representations of the same data):
+    - `directReports` — immediate reports only (level 1).
+    - `allReports` — every descendant, flat list, BFS order, with level numbers
+      relative to the selected employee.
+    - `reportingTree` — same data as a fully nested recursive structure.
+
+    All downward results resolve only **active** employees (STAT2 = 3) via A008.
+    Vacant positions are included with `pernr = null`.
+    """
+    emp = store.pa_by_pernr.get(pernr)
+    if emp is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Employee PERNR {pernr} not found or not active (STAT2 ≠ 3).",
+        )
+
+    p1      = emp["pa0001"][0] if emp.get("pa0001") else {}
+    root_pos = str(p1.get("plans", "")) if p1.get("plans") else None
+
+    return EmployeeDetailResponse(
+        selectedEmployee=_build_employee(emp),
+        positions=_build_position(emp),
+        managerChain=_build_managers(emp),
+        directReports=_build_direct_reports(root_pos) if root_pos else [],
+    )
+
+
+@app.get(
+    "/employees",
+    summary="List all active employee PERNRs with basic info",
+    tags=["Employee"],
+)
+def list_employees():
+    result = []
+    for pernr, emp in sorted(store.pa_by_pernr.items()):
+        p2  = emp["pa0002"][0] if emp.get("pa0002") else {}
+        p1  = emp["pa0001"][0] if emp.get("pa0001") else {}
+        org = store.pos_to_org.get(str(p1.get("plans", "")), {})
+        result.append({
+            "pernr":        pernr,
+            "full_name":    f"{p2.get('vorna', '')} {p2.get('nachn', '')}".strip(),
+            "org_unit_id":  str(p1["orgeh"]) if p1.get("orgeh") else None,
+            "org_unit_name": org.get("name"),
+        })
+    return {"total": len(result), "employees": result}
+
+
+@app.get("/health", tags=["System"])
+def health():
+    return {"status": "ok", "active_employees": len(store.pa_by_pernr)}
+
+
+# ---------------------------------------------------------------------------
+# Private helpers (used by both upward and downward builders)
+# ---------------------------------------------------------------------------
 def _build_employee(emp: dict) -> EmployeeModel:
     p2 = emp["pa0002"][0] if emp.get("pa0002") else {}
     p1 = emp["pa0001"][0] if emp.get("pa0001") else {}
@@ -278,125 +503,3 @@ def _build_position(emp: dict) -> list[PositionModel]:
         valid_from=p1.get("begda", ""),
         valid_to=p1.get("endda", ""),
     )]
-
-
-def _resolve_holder_pernr(holder: dict) -> Optional[int]:
-    """Given an A008 holder {type, id}, return the pernr (int) or None."""
-    if holder["type"] == "P":
-        return store.pernr_by_padded.get(holder["id"])
-    if holder["type"] == "US":
-        return store.pernr_by_userid.get(holder["id"].upper())
-    return None
-
-
-def _build_managers(emp: dict) -> list[ManagerModel]:
-    p1 = emp["pa0001"][0] if emp.get("pa0001") else {}
-    current_pos = str(p1.get("plans", "")) if p1.get("plans") else None
-    if not current_pos:
-        return []
-
-    managers: list[ManagerModel] = []
-    visited: set[str] = {current_pos}
-
-    for level in range(1, MAX_MANAGER_LEVELS + 1):
-        supervisor_pos = store.reports_to.get(current_pos)
-        if not supervisor_pos or supervisor_pos in visited:
-            break
-        visited.add(supervisor_pos)
-
-        org = store.pos_to_org.get(supervisor_pos, {})
-        mgr = ManagerModel(
-            level=level,
-            pernr=None,
-            first_name=None,
-            last_name=None,
-            full_name=None,
-            email=None,
-            sap_user_id=None,
-            position_id=supervisor_pos,
-            position_title=store.pos_text.get(supervisor_pos),
-            org_unit_id=org.get("id"),
-            org_unit_name=org.get("name"),
-        )
-
-        holder = store.pos_to_holder.get(supervisor_pos)
-        if holder:
-            mgr_pernr = _resolve_holder_pernr(holder)
-            if mgr_pernr and mgr_pernr in store.pa_by_pernr:
-                mgr_emp = store.pa_by_pernr[mgr_pernr]
-                p2 = mgr_emp["pa0002"][0] if mgr_emp.get("pa0002") else {}
-                fn = p2.get("vorna", "")
-                ln = p2.get("nachn", "")
-                email = sap_user = None
-                for comm in mgr_emp.get("pa0105", []):
-                    if comm["subty"] == "0001" and comm["usrid"]:
-                        sap_user = comm["usrid"]
-                    elif comm["subty"] == "0010" and comm.get("usridLong"):
-                        email = comm["usridLong"].strip()
-                mgr.pernr = mgr_pernr
-                mgr.first_name = fn
-                mgr.last_name = ln
-                mgr.full_name = f"{fn} {ln}".strip()
-                mgr.email = email
-                mgr.sap_user_id = sap_user
-
-        managers.append(mgr)
-        current_pos = supervisor_pos
-
-    return managers
-
-
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-@app.get(
-    "/employee/{pernr}",
-    response_model=EmployeeDetailResponse,
-    summary="Get employee details, positions, and management chain",
-    tags=["Employee"],
-)
-def get_employee(pernr: int):
-    """
-    Returns full employee profile for the given PERNR:
-    - **employee** – personal data, org assignment, pay, contact info
-    - **positions** – current position with org unit
-    - **managers** – reporting chain (level 1 = direct manager, up to 10 levels)
-    """
-    emp = store.pa_by_pernr.get(pernr)
-    if emp is None:
-        raise HTTPException(status_code=404, detail=f"Employee PERNR {pernr} not found or not active.")
-
-    return EmployeeDetailResponse(
-        employee=_build_employee(emp),
-        positions=_build_position(emp),
-        managers=_build_managers(emp),
-    )
-
-
-@app.get(
-    "/employees",
-    summary="List all active employee PERNRs with basic info",
-    tags=["Employee"],
-)
-def list_employees():
-    """
-    Returns all active employee PERNRs with name and org unit.
-    Useful for populating dropdowns and map analytics.
-    """
-    result = []
-    for pernr, emp in sorted(store.pa_by_pernr.items()):
-        p2 = emp["pa0002"][0] if emp.get("pa0002") else {}
-        p1 = emp["pa0001"][0] if emp.get("pa0001") else {}
-        org = store.pos_to_org.get(str(p1.get("plans", "")), {})
-        result.append({
-            "pernr": pernr,
-            "full_name": f"{p2.get('vorna', '')} {p2.get('nachn', '')}".strip(),
-            "org_unit_id": str(p1["orgeh"]) if p1.get("orgeh") else None,
-            "org_unit_name": org.get("name"),
-        })
-    return {"total": len(result), "employees": result}
-
-
-@app.get("/health", tags=["System"])
-def health():
-    return {"status": "ok", "active_employees": len(store.pa_by_pernr)}
